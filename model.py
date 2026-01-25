@@ -354,6 +354,8 @@ class FunASRNano(nn.Module):
                     source_input = f"<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n"
             if not do_think:
                 source_input += "<think>\n\n</think>\n\n"
+            if kwargs.get("prev_text", None) is not None:
+                source_input += kwargs["prev_text"]
 
             splits = pattern.split(source_input)
             source_ids = []
@@ -514,7 +516,7 @@ class FunASRNano(nn.Module):
         fbank_beg = batch["fbank_beg"]
         fake_token_len = batch["fake_token_len"]
 
-        if not kwargs.get("tearchforing", False):
+        if not kwargs.get("teacherforcing", False):
             input_ids = source_ids
 
         input_ids[input_ids < 0] = 0
@@ -698,6 +700,7 @@ class FunASRNano(nn.Module):
                     skip_special_tokens=kwargs.get("skip_special_tokens", True),
                 )[0]
                 loss = model_outputs.loss.item()
+        response = kwargs.get("prev_text", "") + response
 
         ibest_writer = None
         if kwargs.get("output_dir") is not None:
