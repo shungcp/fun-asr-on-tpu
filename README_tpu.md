@@ -10,43 +10,61 @@ This is a hobby project to try debugging and running ASR model inference on Tril
 
 ## Progress:
 
+[guess] this is just for one request, will be almost the same for batch mode
+[TODO] develop a batch mode inference API
+
+### 2026-02-03
+
+fixed the issue of output text inconsistent with ctc_text.
+
+```
+--- Run 1 ---
+  0%|                                                             | 0/1 [00:00<?, ?it/s]
+rtf_avg: 4.317: 100%|█████████████████████████████████████████1/1 [00:24<00:00, 24.35s/it]
+CTC Text: 开饭时间早上九点至下午五点
+Output (text field only): 开饭时间早上九点至下午五点。
+Run 1 Duration: 25.0106s
+
+--- Run 2 ---
+  0%|                                                             | 0/1 [00:00<?, ?it/s]
+rtf_avg: 0.116: 100%|█████████████████████████████████████████1/1 [00:00<00:00,  1.52it/s]
+CTC Text: 开饭时间早上九点至下午五点
+Output (text field only): 开饭时间早上九点至下午五点。
+Run 2 Duration: 1.4024s
+
+--- Run 3 ---
+  0%|                                                             | 0/1 [00:00<?, ?it/s]
+rtf_avg: 0.121: 100%|█████████████████████████████████████████1/1 [00:00<00:00,  1.46it/s]
+CTC Text: 开饭时间早上九点至下午五点
+Output (text field only): 开饭时间早上九点至下午五点。
+Run 3 Duration: 1.4208s
+```
+
 ### 2026-02-02 
 
 port the model Fun-ASR-Nano-2512 on v6e-1 with torchax, metrics:  1.26it/s
 
-[guess] this is just for one request, will be almost the same for batch mode
-[TODO] develop a batch mode inference API
-[ISSUE] Output is not the same as ctc_text, need to figure out the RCA.
+<strike>[ISSUE] Output is not the same as ctc_text.</strike>
 
 ```
 --- Run 1 ---
-  0%|                                                                                       | 0/1 [00:00<?, ?it/s]
-DEBUG: encode input speech: torch.Size([1, 94, 560]), lengths: tensor([94], dtype=torch.int32)
-DEBUG: encode output encoder_out: torch.Size([1, 94, 512]), lens type: <class 'torch.Tensor'>
-DEBUG: encode output lens shape: torch.Size([1])
-DEBUG: encode output lens val: tensor([94], dtype=torch.int32)
-`torch_dtype` is deprecated! Use `dtype` instead!
-rtf_avg: 4.424: 100%|███████████████████████████████████████████████████████████████| 1/1 [00:24<00:00, 24.95s/it]
+  0%|                                                         | 0/1 [00:00<?, ?it/s]
+rtf_avg: 4.424: 100%|█████████████████████████████████████████1/1 [00:24<00:00, 24.95s/it]
+CTC Text: 开饭时间早上九点至下午五点
 Output (text field only): 开饭时间早上九点开饭时间早上九点开饭时间早上
 Run 1 Duration: 25.6478s
 
 --- Run 2 ---
-  0%|                                                                                       | 0/1 [00:00<?, ?it/s]
-DEBUG: encode input speech: torch.Size([1, 94, 560]), lengths: tensor([94], dtype=torch.int32)
-DEBUG: encode output encoder_out: torch.Size([1, 94, 512]), lens type: <class 'torch.Tensor'>
-DEBUG: encode output lens shape: torch.Size([1])
-DEBUG: encode output lens val: tensor([94], dtype=torch.int32)
-rtf_avg: 0.149: 100%|███████████████████████████████████████████████████████████████| 1/1 [00:00<00:00,  1.19it/s]
+  0%|                                                         | 0/1 [00:00<?, ?it/s]
+rtf_avg: 0.149: 100%|█████████████████████████████████████████1/1 [00:00<00:00,  1.19it/s]
+CTC Text: 开饭时间早上九点至下午五点
 Output (text field only): 开饭时间早上九点开饭时间早上九点开饭时间早上
 Run 2 Duration: 1.5870s
 
 --- Run 3 ---
-  0%|                                                                                       | 0/1 [00:00<?, ?it/s]
-DEBUG: encode input speech: torch.Size([1, 94, 560]), lengths: tensor([94], dtype=torch.int32)
-DEBUG: encode output encoder_out: torch.Size([1, 94, 512]), lens type: <class 'torch.Tensor'>
-DEBUG: encode output lens shape: torch.Size([1])
-DEBUG: encode output lens val: tensor([94], dtype=torch.int32)
-rtf_avg: 0.141: 100%|███████████████████████████████████████████████████████████████| 1/1 [00:00<00:00,  1.26it/s]
+  0%|                                                         | 0/1 [00:00<?, ?it/s]
+rtf_avg: 0.141: 100%|█████████████████████████████████████████1/1 [00:00<00:00,  1.26it/s]
+CTC Text: 开饭时间早上九点至下午五点
 Output (text field only): 开饭时间早上九点开饭时间早上九点开饭时间早上
 Run 3 Duration: 1.5562s
 ```

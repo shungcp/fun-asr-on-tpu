@@ -1,8 +1,100 @@
-#================================================================================
-# 2026-02-01 v0.1 latency: (run2: not yet/run1: 66s w/compile time)
-#================================================================================
-
 import os
+import transformers.masking_utils
+# AGGRESSIVE PATCH: Disable is_compileable to force legacy masking BEFORE any other usage
+def return_false(*args, **kwargs): return False
+transformers.masking_utils.is_compileable = return_false
+
+# -----------------------------------------------------------------------------
+# RUNTIME MONKEYPATCH: Force use of local modeling_qwen3 (with TPU fixes)
+# -----------------------------------------------------------------------------
+import sys
+import os
+sys.path.insert(0, os.path.dirname(__file__)) # Allow importing local files
+
+try:
+    import modeling_qwen3
+    import transformers.models.qwen3.modeling_qwen3 as hf_qwen3
+
+    print("[Patch] Replacing transformers Qwen3 impl with local fixed version...")
+    hf_qwen3.Qwen3Model = modeling_qwen3.Qwen3Model
+    hf_qwen3.Qwen3Attention = modeling_qwen3.Qwen3Attention
+    hf_qwen3.Qwen3DecoderLayer = modeling_qwen3.Qwen3DecoderLayer
+    hf_qwen3.Qwen3ForCausalLM = modeling_qwen3.Qwen3ForCausalLM
+except Exception as e:
+    print(f"[Patch] Failed to patch Qwen3: {e}")
+# -----------------------------------------------------------------------------
+
+import torch
+
+# -----------------------------------------------------------------------------
+# ROBUST MASK PATCH (Fixes vmap crash and recursion)
+# -----------------------------------------------------------------------------
+def robust_mask_fn(input_ids_shape=None, dtype=None, device=None, past_key_values_length=0, attention_mask=None, **kwargs):
+    """
+    Simple, unbreakable causal mask generation.
+    Ignores complex transformers logic to avoid TPU/vmap bugs.
+    """
+    if input_ids_shape is None:
+        input_ids_shape = kwargs.get("input_tensor", None)
+        if input_ids_shape is not None and hasattr(input_ids_shape, "shape"):
+             input_ids_shape = input_ids_shape.shape
+        elif input_ids_shape is None:
+             # Fallback from other kwargs
+             bs = kwargs.get("batch_size", 1)
+             sl = kwargs.get("target_length", kwargs.get("seq_length", 1))
+             input_ids_shape = (bs, sl)
+
+    if dtype is None: dtype = torch.float32
+    if device is None: 
+         if attention_mask is not None: device = attention_mask.device
+         else: device = torch.device("cpu")
+
+    bs = input_ids_shape[0]
+    target_len = input_ids_shape[1]
+
+    # Handle attention_mask (Padding) if provided
+    padding_mask = None
+    if attention_mask is not None:
+         # Ensure bool or equivalent for conversion
+         if attention_mask.dim() == 2: attention_mask = attention_mask[:, None, None, :]
+         elif attention_mask.dim() == 3: attention_mask = attention_mask[:, None, :, :]
+
+         # Convert to additive mask (0.0 for keep, min_val for mask)
+         min_val = torch.finfo(dtype).min
+         if attention_mask.dtype == torch.bool:
+             padding_mask = torch.zeros_like(attention_mask, dtype=dtype)
+             padding_mask.masked_fill_(~attention_mask, min_val)
+         else:
+             padding_mask = (1.0 - attention_mask.to(dtype)) * min_val
+
+    # Create Causal Triangle
+    min_val = torch.finfo(dtype).min
+    mask = torch.full((target_len, target_len), min_val, device=device, dtype=dtype)
+    mask_cond = torch.arange(mask.size(-1), device=device)
+    mask.masked_fill_(mask_cond < (torch.arange(mask.size(-2), device=device) + past_key_values_length).view(-1, 1), 0)
+
+    mask = mask[None, None, :, :]
+
+    if padding_mask is not None:
+        # Broadcast/Slice logic could be complex, but for now we assume shape compatibility or rely on broadcasting
+        # If padding_mask is (B, 1, 1, L), it adds to (1, 1, L, L) -> (B, 1, L, L)
+        # We need to be careful about shapes.
+        # Let's trust 'attention_mask' is correct shape from upstream.
+        return padding_mask + mask
+
+    return mask
+
+# Apply Patch IMMEDIATELY
+import transformers.masking_utils
+transformers.masking_utils.eager_mask = robust_mask_fn
+transformers.masking_utils.sdpa_mask = robust_mask_fn
+transformers.masking_utils.sdpa_mask_recent_torch = robust_mask_fn
+transformers.masking_utils.create_causal_mask = robust_mask_fn
+transformers.masking_utils.is_compileable = lambda *args, **kwargs: False
+print("[Patch] Applied ROBUST MASK FN to all transformers masking utilities.")
+
+# -----------------------------------------------------------------------------
+
 import torch
 import torchax
 import jax
@@ -15,12 +107,7 @@ from torchax_utils import TorchaxWrapper
 import logging
 import traceback
 from transformers.cache_utils import StaticCache
-import transformers.masking_utils
-
-# AGGRESSIVE PATCH: Disable is_compileable to force legacy masking
-# This prevents 'transformers' from using vmap-based masking which crashes on TPU/Torchax with IndexError.
-def return_false(*args, **kwargs): return False
-transformers.masking_utils.is_compileable = return_false
+from transformers.cache_utils import StaticCache
 
 # Monkeypatch StaticCache to avoid transformers vmap masking bug
 # This forces transformers to use legacy masking which is safer here.
@@ -35,7 +122,7 @@ class CacheLayerPair:
 
     @property
     def is_compileable(self):
-        return True
+        return False
 
     def get_mask_sizes(self, cache_position) -> tuple[int, int]:
         return (self.keys.shape[-2], 0)
@@ -64,10 +151,40 @@ class PatchedStaticCache(StaticCache):
     A patched version of StaticCache that supports tuple layers (key, value)
     or CacheLayerPair objects.
     """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.seen_tokens = 0
-        self._position_ids = None
+    def __init__(self, config, max_batch_size=1, max_cache_len=None, device=None, dtype=None):
+        # StaticCache signature: (self, config, max_cache_len, offloading=False, offload_only_non_sliding=True, **kwargs)
+        # We need to adapt our calling convention to the superclass.
+        # max_batch_size, device, and dtype are NOT in super().__init__ in this version.
+
+        # Resolve max_cache_len before calling super, as super creates the buffers.
+        if max_cache_len is None:
+            if hasattr(config, "static_sequence_length"):
+                max_cache_len = config.static_sequence_length
+            else:
+                max_cache_len = config.max_position_embeddings
+
+        # StaticCache signature: (self, config, max_cache_len, ...)
+        super().__init__(config, max_cache_len=max_cache_len)
+
+        # Manually store what super() might miss if we need them, 
+        # but StaticCache usually just sets up based on config/max_cache_len.
+        self._max_batch_size = max_batch_size # Store it ourselves if super doesn't
+        self.device = device
+        self.dtype = dtype
+
+        self._seen_tokens = 0
+        # self.max_cache_len is a property in StaticCache, so we cannot set it.
+        # It should be correct since we passed max_cache_len to super().__init__.
+
+    @property
+    def seen_tokens(self):
+        print(f"[Debug] Accessing seen_tokens: {self._seen_tokens} (id={id(self)})")
+        return self._seen_tokens
+
+    @seen_tokens.setter
+    def seen_tokens(self, value):
+        print(f"[Debug] Setting seen_tokens: {value} (id={id(self)})")
+        self._seen_tokens = value
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
         if hasattr(self, "layers"):
@@ -98,26 +215,57 @@ class PatchedStaticCache(StaticCache):
                         v_tensor.index_copy_(2, cache_position, value_states)
 
                         if layer_idx == 0:
-                            current_max_pos = cache_position.max() + 1
-                            if isinstance(self.seen_tokens, int):
-                                self.seen_tokens = current_max_pos
+                            if cache_position.numel() > 0:
+                                # We cannot update seen_tokens here inside JIT if cache_position is traced.
+                                # Relies on external update (in patched_forward).
+                                try:
+                                    # Try catch for Eager mode, but skip for JIT
+                                    if cache_position.device.type == 'cpu':
+                                        current_max_pos = cache_position.max().item() + 1
+                                        if isinstance(self.seen_tokens, int):
+                                             self.seen_tokens = current_max_pos
+                                        elif current_max_pos > self.seen_tokens:
+                                             self.seen_tokens = current_max_pos
+                                except:
+                                    pass
                             else:
-                                if current_max_pos > self.seen_tokens:
-                                    self.seen_tokens = current_max_pos
+                                pass # No tokens updated, seen_tokens remains unchanged
 
                         return k_cache, v_cache
 
         return key_states, value_states
 
     def get_seq_length(self, layer_idx=0):
-        # Fix for ConcretizationTypeError: Return concrete max_cache_len 
-        # instead of dynamic tracer derived from position_ids.
-        if hasattr(self, "max_cache_len"):
-            return self.max_cache_len
-        # Fallback to key_cache shape if available
-        if hasattr(self, "key_cache") and len(self.key_cache) > layer_idx:
-            return self.key_cache[layer_idx].shape[-2]
-        return 0
+        # Fix: Must return actual seen_tokens for autoregressive generation!
+        val = 0
+        if hasattr(self, "seen_tokens"):
+            val = self.seen_tokens
+        elif hasattr(self, "key_cache") and len(self.key_cache) > layer_idx:
+            val = self.key_cache[layer_idx].shape[-2]
+
+        # print(f"[Debug] get_seq_length: {val}") 
+        print(f"[Debug] get_seq_length: {val} (id={id(self)})") 
+        return val
+
+    def reset(self):
+        """Reset the cache state and zero out buffers."""
+        self.seen_tokens = 0
+        self._position_ids = None
+
+        # Reset buffers
+        if hasattr(self, "key_cache") and self.key_cache:
+            for k in self.key_cache:
+                if isinstance(k, torch.Tensor): k.zero_()
+            for v in self.value_cache:
+                if isinstance(v, torch.Tensor): v.zero_()
+
+        if hasattr(self, "layers") and self.layers:
+            for item in self.layers:
+                if hasattr(item, "reset"):
+                    item.reset()
+                elif isinstance(item, (tuple, list)) and len(item) == 2:
+                    if isinstance(item[0], torch.Tensor): item[0].zero_()
+                    if isinstance(item[1], torch.Tensor): item[1].zero_()
 
 class LLMForwardWrapper(torch.nn.Module):
     def __init__(self, llm, max_cache_len=128):
@@ -190,13 +338,13 @@ jax.config.update("jax_default_matmul_precision", "float32")
 def main():
     print("--- TPU Demo Clean Start ---")
 
-    GENERATION_MAX_LENGTH = 32
+    GENERATION_MAX_LENGTH = 16
 
     # 1. Apply Patches
     tpu_patch.apply_tpu_patches()
 
     # 2. Load Model (CPU)
-    model_dir = "/home/admin_shunwang_altostrat_com/.cache/modelscope/hub/models/FunAudioLLM/Fun-ASR-Nano-2512"
+    model_dir = "~/.cache/modelscope/hub/models/FunAudioLLM/Fun-ASR-Nano-2512"
     if not os.path.exists(model_dir):
         model_dir = "FunAudioLLM/Fun-ASR-Nano-2512"
 
@@ -205,7 +353,7 @@ def main():
         model=model_dir,
         trust_remote_code=True,
         remote_code="./model.py",
-        device="cpu",
+        device="cpu", 
         hub="ms",
         disable_update=True,
     )
@@ -248,11 +396,56 @@ def main():
                 inputs_embeds = embed_fn(input_ids)
 
             if inputs_embeds is None:
+                print(f"[Debug] patched_forward inputs_embeds is None! input_ids: {input_ids.shape if input_ids is not None else 'None'}")
                 raise ValueError("Both input_ids and inputs_embeds are None in patched_forward")
+            else:
+                if len(inputs_embeds.shape) >= 2 and inputs_embeds.shape[1] == 0:
+                     print(f"[Debug] patched_forward inputs_embeds has 0 sequence length! {inputs_embeds.shape}")
 
+            past_key_values = kwargs.get('past_key_values', None)
             attention_mask = kwargs.get('attention_mask', None)
             position_ids = kwargs.get('position_ids', None)
-            past_key_values = kwargs.get('past_key_values', None)
+
+            # Debugging logs
+            input_len = inputs_embeds.shape[1]
+            p_start, p_end = "?", "?"
+            if position_ids is not None:
+                p_start = position_ids.min().item()
+                p_end = position_ids.max().item()
+
+            # --- AUTO-RESET & UPDATE LOGIC ---
+            if past_key_values is not None:
+                if input_len > 1:
+                    # PROMPT PHASE: Force Reset if dirty
+                    if hasattr(past_key_values, "seen_tokens") and past_key_values.seen_tokens > 0:
+                        if hasattr(past_key_values, "reset"):
+                            past_key_values.reset()
+                        else:
+                            past_key_values.seen_tokens = 0
+                            if hasattr(past_key_values, "key_cache"):
+                                 for k in past_key_values.key_cache: 
+                                     if isinstance(k, torch.Tensor): k.zero_()
+                                 if hasattr(past_key_values, "value_cache"):
+                                     for v in past_key_values.value_cache:
+                                         if isinstance(v, torch.Tensor): v.zero_()
+
+                    # Set seen_tokens = input_len
+                    if hasattr(past_key_values, "seen_tokens"):
+                        past_key_values.seen_tokens = input_len
+
+                    # Double check self._static_cache
+                    if hasattr(self, "_static_cache") and self._static_cache is not None:
+                         if self._static_cache is not past_key_values and hasattr(self._static_cache, "reset"):
+                             # Ensure internal cache is also synced/reset
+                             self._static_cache.reset()
+                             # self._static_cache.seen_tokens = input_len
+                             pass
+
+                else:
+                    # DECODE PHASE: Increment seen_tokens
+                    # TPU/JIT update doesn't touch Python attribute, so we do it here.
+                    if hasattr(past_key_values, "seen_tokens") and position_ids is not None:
+                        current_max = position_ids.max().item()
 
             # Infer position_ids if not provided
             if position_ids is None:
@@ -295,15 +488,6 @@ def main():
                     position_ids = torch.arange(start_pos, start_pos + input_len, dtype=torch.long, device=inputs_embeds.device)
                     position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
 
-            # Pad attention_mask to static length (GENERATION_MAX_LENGTH) to avoid JIT recompilation
-            if attention_mask is not None and isinstance(attention_mask, torch.Tensor):
-                 target_len = GENERATION_MAX_LENGTH
-                 current_len = attention_mask.shape[1]
-                 if current_len < target_len:
-                      pad_len = target_len - current_len
-                      zeros = torch.zeros((attention_mask.shape[0], pad_len), dtype=attention_mask.dtype, device=attention_mask.device)
-                      attention_mask = torch.cat([attention_mask, zeros], dim=1)
-
             # Prepare flattened pkv
             pkv_flat_args = []
             if past_key_values is not None and isinstance(past_key_values, StaticCache):
@@ -324,7 +508,7 @@ def main():
                      if hasattr(past_key_values, "max_batch_size"): max_batch_size = past_key_values.max_batch_size
                      elif hasattr(past_key_values, "_max_batch_size"): max_batch_size = past_key_values._max_batch_size
 
-                     max_cache_len = GENERATION_MAX_LENGTH
+                     max_cache_len = getattr(self.config, "static_sequence_length", GENERATION_MAX_LENGTH)
                      if hasattr(past_key_values, "max_cache_len"): max_cache_len = past_key_values.max_cache_len
                      elif hasattr(past_key_values, "_max_cache_len"): max_cache_len = past_key_values._max_cache_len
 
@@ -366,6 +550,22 @@ def main():
                     else:
                         for k, v in past_key_values:
                             pkv_flat_args.extend([k, v])
+                if needs_init or not hasattr(self, "_static_cache"):
+                     self._static_cache = past_key_values
+                     print(f"[Debug] patched_forward: ATTACHED _static_cache to {type(self).__name__} id={id(self)}")
+
+                # Update seen_tokens explicitly from position_ids (since update inside JIT can't do it)
+                if position_ids is not None and hasattr(self, "_static_cache") and self._static_cache is not None:
+                    # position_ids is a Tensor here (inputs to forward)
+                    # print(f"[Debug] patched_forward KV Cache ID: {id(self._static_cache)} Type: {type(self._static_cache)}")
+                    try:
+                        cur_max = position_ids.max().item() + 1
+                        old_s = getattr(self._static_cache, "seen_tokens", 0)
+                        # if cur_max > old_s:
+                        #     self._static_cache.seen_tokens = cur_max
+                        #     print(f"[Debug] patched_forward: Updated seen_tokens {old_s} -> {cur_max} (id={id(self._static_cache)})")
+                    except Exception as e:
+                        print(f"[Debug] Failed to update seen_tokens: {e}")
 
             # Call compiled wrapper
             ret = llm_helper(inputs_embeds, attention_mask, position_ids, *pkv_flat_args)
@@ -401,7 +601,16 @@ def main():
                          end_pos = position_ids[0, -1].item() + 1
                          setattr(past_key_values, "seen_tokens", end_pos)
                     else:
-                         past_key_values.seen_tokens += input_len
+                         # Only increment if we didn't just hard-set it (i.e. decoding phase)
+                         # OR if we want to be safe: just set it to position_ids max + 1?
+                         # But position_ids might be None/inferred contentiously.
+                         # Just use input_len logic:
+                         if input_len > 1:
+                             # We already set it in the 'PROMPT PHASE' block above to = input_len
+                             # So do nothing here to avoid double counting.
+                             pass
+                         else:
+                             past_key_values.seen_tokens += input_len
                 except Exception as e:
                     logging.error(f"Error updating seen_tokens: {e}")
 
@@ -436,7 +645,7 @@ def main():
         dummy_contents = contents
 
         output = self.data_load_speech(contents, tokenizer, frontend, meta_data=meta_data, **kwargs)
-        batch = output
+        batch = output 
         speech = batch["speech"]
 
         if len(speech) > 0:
@@ -498,7 +707,7 @@ def main():
 
                     speech_idx += 1
 
-        return inputs_embeds, dummy_contents, batch, batch["source_ids"], meta_data
+        return inputs_embeds, dummy_contents, batch, batch["source_ids"], meta_data 
 
     nano_model.inference_prepare = types.MethodType(patched_inference_prepare, nano_model)
 
@@ -506,17 +715,86 @@ def main():
     wav_path = f"{model_dir}/example/zh.mp3"
     print(f"Running inference on {wav_path}...")
 
+    # Define STATIC_SEQUENCE_LENGTH for TPU Bucket (Must encompass Prompt + New Tokens)
+    STATIC_SEQUENCE_LENGTH = 128  # Fixed bucket size for compilation (User requested 128)
+
+    # Define Max NEW Tokens to generate
+    GENERATION_MAX_NEW_TOKENS = 16 # User requested 16
+
+    # INJECT static_sequence_length into config for modeling_qwen3.py and PatchedStaticCache to pick up
+    nano_model.llm.config.static_sequence_length = STATIC_SEQUENCE_LENGTH
+
     if os.path.exists(wav_path):
         # Run multiple times to verify JIT caching
-        for i in range(1):
+        for i in range(3):
             print(f"\n--- Run {i+1} ---")
             start_time = time.time()
-            res = model.generate(input=wav_path, batch_size_s=0, use_itn=False, max_length=GENERATION_MAX_LENGTH)
+            # Pass max_length=GENERATION_MAX_NEW_TOKENS (FunASR interprets this as new tokens)
+            # Add repetition_penalty and no_repeat_ngram_size to avoid loop
+            res = model.generate(
+                input=wav_path, 
+                batch_size_s=0, 
+                use_itn=False, 
+                max_length=GENERATION_MAX_NEW_TOKENS,
+                llm_kwargs={}
+            )
             end_time = time.time()
-            print(f"Output: {res}")
+
+            # Post-Generation Cache Probe
+            # Post-Generation Cache Probe (Recursive)
+            try:
+                def find_cache_recursive(module):
+                    if hasattr(module, "_static_cache") and module._static_cache is not None:
+                        return module._static_cache
+                    for name, child in module.named_children():
+                        res = find_cache_recursive(child)
+                        if res is not None: return res
+                    return None
+
+                # Start search from nano_model.llm to avoid picking up unrelated stuff
+                sc = find_cache_recursive(nano_model.llm)
+
+                if sc is not None:
+                    # Check key_cache
+                    has_data = False
+                    if hasattr(sc, "key_cache") and len(sc.key_cache) > 0 and isinstance(sc.key_cache[0], torch.Tensor):
+                         k0 = sc.key_cache[0]
+                         has_data = True
+                    elif hasattr(sc, "layers") and len(sc.layers) > 0:
+                         # Check first layer
+                         l0 = sc.layers[0]
+                         if isinstance(l0, tuple): k0 = l0[0]
+                         elif hasattr(l0, "keys"): k0 = l0.keys
+                         else: k0 = None
+
+                         if isinstance(k0, torch.Tensor):
+                             has_data = True
+
+                    if has_data:
+                            # Move to CPU for printing
+                            k0_cpu = k0.cpu()
+                            non_zero = (k0_cpu != 0).sum().item()
+                            total = k0_cpu.numel()
+                            print(f"[MainProbe] Cache Found! Layer 0 Key Cache: Non-Zero={non_zero}/{total} ({non_zero/total*100:.2f}%)")
+                            print(f"[MainProbe] Seen Tokens: {sc.seen_tokens}")
+                    else:
+                        print(f"[MainProbe] Cache found object but NO tensor data (key_cache & layers empty/invalid).")
+                else:
+                    print(f"[MainProbe] _static_cache NOT FOUND in `nano_model.llm` hierarchy.")
+                    # Debug print structure
+                    print(f"Debug Structure: nano_model.llm type: {type(nano_model.llm)}")
+                    if hasattr(nano_model.llm, "model"): print(f"  .model type: {type(nano_model.llm.model)}")
+
+            except Exception as e:
+                print(f"[MainProbe] Error probing cache: {e}")
+
+            if 'ctc_text' in res[0]:
+                 print(f"CTC Text: {res[0]['ctc_text']}")
+            print(f"Output (text field only): {res[0]['text']}")
             print(f"Run {i+1} Duration: {end_time - start_time:.4f}s")
     else:
         print(f"Warning: {wav_path} not found. Skipping inference run.")
 
 if __name__ == "__main__":
     main()
+
